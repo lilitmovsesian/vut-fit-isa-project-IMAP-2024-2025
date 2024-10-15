@@ -5,8 +5,11 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <regex.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <arpa/inet.h>
 
-char *construct_message(int sock, int *current_message_count, char *text);
+char *construct_message(SSL *ssl, int *current_message_count, char *text);
 
 void error_exit(char *msg, int code) {
     if (msg != NULL)
@@ -71,6 +74,41 @@ int connect_to_imap(char *server, char *port){
     return sock;
 }
 
+
+SSL *connect_to_imaps(char *server, char *port) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    const SSL_METHOD *method = SSLv23_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        error_exit("Failed to create SSL context.", EXIT_FAILURE);
+    }
+    int sock = connect_to_imap(server, port);
+    
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        error_exit("SSL connection failed.", EXIT_FAILURE);
+    }
+
+    printf("Connected to IMAPS server with encryption.\n");
+    return ssl;
+}
+
+/*void cleanup_ssl(SSL *ssl, SSL_CTX *ctx, int sock) {
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(sock);
+    SSL_CTX_free(ctx);
+    ERR_free_strings();
+    EVP_cleanup();
+}*/
+
 void parse_auth_file(char *auth_file, char *username, char *password) {
     FILE *file = fopen(auth_file, "r");
     if (!file) {
@@ -88,47 +126,41 @@ void parse_auth_file(char *auth_file, char *username, char *password) {
     fclose(file);
 }
 
-
-void send_imap_message(int sock, char *message) {
-    if (send(sock, message, strlen(message), 0) == -1) {
-        close(sock);
-        error_exit("Failed to send IMAP message.", EXIT_FAILURE);
+void send_imap_message_ssl(SSL *ssl, char *message) {
+    if (SSL_write(ssl, message, strlen(message)) <= 0) {
+        SSL_shutdown(ssl);
+        error_exit("Failed to send IMAP message through SSL.", EXIT_FAILURE);
     }
 }
 
-char *receive_imap_message(int sock){
+char *receive_imap_message_ssl(SSL *ssl) {
     size_t buffer_size = 100000;
     char buffer[buffer_size];
     char *response = calloc(10000000, 1);
     if (response == NULL) {
-        close(sock);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     int received;
     
-    while ((received = recv(sock, buffer, buffer_size, 0)) > 0) {
+    while ((received = SSL_read(ssl, buffer, buffer_size)) > 0) {
         buffer[received] = '\0';
         strcat(response, buffer);
         if (strstr(response, "\r\n")) {
             break;
         }
     }
-    if (received < 0) {
-        close(sock);
+    if (received <= 0) {
+        SSL_shutdown(ssl);
         error_exit("Failed to receive response.", EXIT_FAILURE);
-    }
-    else if (received == 0) {
-        close(sock);
-        error_exit("Connection closed by peer.", EXIT_FAILURE);
     }
     return response;
 }
 
-int imap_command(int *current_message_count, int sock, char *response_p, char *command_format, ...) {
+int imap_command(int *current_message_count, SSL *ssl, char *response_p, char *command_format, ...) {
 
     char *text = calloc(4096, 1);
     if (text == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
 
@@ -137,11 +169,11 @@ int imap_command(int *current_message_count, int sock, char *response_p, char *c
     vsnprintf(text, 4096, command_format, args);
     va_end(args);
 
-    char *message = construct_message(sock, current_message_count, text);
+    char *message = construct_message(ssl, current_message_count, text);
     free(text);
-    send_imap_message(sock, message);
+    send_imap_message_ssl(ssl, message);
     free(message);
-    char *response = receive_imap_message(sock);
+    char *response = receive_imap_message_ssl(ssl);
     printf("RESPONSE %s\n", response);
     int received_ID;
 
@@ -174,45 +206,45 @@ int imap_command(int *current_message_count, int sock, char *response_p, char *c
 
 }
 
-void login_to_imap(int *current_message_count, int sock, char *username, char *password) {
+void login_to_imap(int *current_message_count, SSL *ssl, char *username, char *password) {
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "LOGIN %s %s", username, password) == 1){
+    if (imap_command(current_message_count, ssl, response, "LOGIN %s %s", username, password) == 1){
         free(response);
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to login.", EXIT_FAILURE);
     }
     free(response);
 }
 
-void select_mailbox(int *current_message_count, int sock, char *mailbox){
+void select_mailbox(int *current_message_count, SSL *ssl, char *mailbox){
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "SELECT %s", mailbox) == 1){
+    if (imap_command(current_message_count, ssl, response, "SELECT %s", mailbox) == 1){
         free(response);
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to select the mailbox.", EXIT_FAILURE);
     }
     free(response);
 }
 
-char *search_mails(int *current_message_count, int sock, char *search_mails_filter){
+char *search_mails(int *current_message_count, SSL *ssl, char *search_mails_filter){
     char *response = calloc(16384, 1);
     char *response_body = calloc(16384, 1);
     if (response == NULL || response_body == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "SEARCH %s", search_mails_filter) == 1){
+    if (imap_command(current_message_count, ssl, response, "SEARCH %s", search_mails_filter) == 1){
         free(response);
         free(response_body);
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to search mails.", EXIT_FAILURE);
     }
     int last_index = strlen(response) - 2;
@@ -225,48 +257,46 @@ char *search_mails(int *current_message_count, int sock, char *search_mails_filt
     return response_body;
 }
 
-char *construct_message(int sock, int *current_message_count, char *text){
+char *construct_message(SSL *ssl, int *current_message_count, char *text){
     char *message = calloc(4096, 1);
     if (message == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     snprintf(message, 4096, "A%d %s\r\n", *current_message_count, text);
     return message;
 }
 
-void handshake(int sock) {
-    char *greeting = receive_imap_message(sock);
+void handshake(SSL *ssl) {
+    char *greeting = receive_imap_message_ssl(ssl);
     if (strstr(greeting, "OK")) {
         free(greeting);
     } else {
         free(greeting);
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to get the server greeting.", EXIT_FAILURE);
     }
 }
 
-char *fetch_message(int *current_message_count, int sock, int message_id, char *request_type) {
+char *fetch_message(int *current_message_count, SSL *ssl, int message_id, char *request_type) {
     size_t fetch_size = 10000000;
     char *full_fetch_response = calloc(fetch_size, 1);
     if (full_fetch_response == NULL) {
-        close(sock);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     char *text = calloc(4096, 1);
     if (text == NULL) {
         free(full_fetch_response);
-        close(sock);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     snprintf(text, 4096, "FETCH %d %s", message_id, request_type);
-    char *message = construct_message(sock, current_message_count, text);
+    char *message = construct_message(ssl, current_message_count, text);
     free(text);
-    send_imap_message(sock, message);
+    send_imap_message_ssl(ssl, message);
     free(message);
     int success = 0;
     while (!success) {
-        char *response = receive_imap_message(sock);
+        char *response = receive_imap_message_ssl(ssl);
         int received_ID;
         
         size_t current_length = strlen(full_fetch_response);
@@ -278,7 +308,7 @@ char *fetch_message(int *current_message_count, int sock, int message_id, char *
             if (new_full_fetch_response == NULL) {
                 free(full_fetch_response);
                 free(response);
-                close(sock);
+                SSL_shutdown(ssl);
                 error_exit("Failed to reallocate memory.", EXIT_FAILURE);
             }
             full_fetch_response = new_full_fetch_response;
@@ -340,6 +370,7 @@ int get_message_length(char *fetch_response, int *body_start) {
 }
 
 
+
 char *get_id_from_header(char *fetch_response) {
     regex_t regex;
     regmatch_t match[2];
@@ -369,15 +400,15 @@ char *get_id_from_header(char *fetch_response) {
     }
 }
 
-int logout(int *current_message_count, int sock){
+int logout(int *current_message_count, SSL *ssl){
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "LOGOUT") == 1){
+    if (imap_command(current_message_count, ssl, response, "LOGOUT") == 1){
         free(response);
-        close(sock);
+        SSL_shutdown(ssl);
         error_exit("Failed to logout.", EXIT_FAILURE);
     }
     free(response);
@@ -478,17 +509,15 @@ int main(int argc, char *argv[]) {
 
     parse_auth_file(auth_file, username, password);
     int current_message_count = 0;
-    int sock = 0;
-    if (!imaps){
-        sock = connect_to_imap(server, port);
-    }
-    handshake(sock);
-    login_to_imap(&current_message_count, sock, username, password);
-    select_mailbox(&current_message_count, sock, mailbox);
+    
+    SSL *ssl = connect_to_imaps(server, port);
+    handshake(ssl);
+    login_to_imap(&current_message_count, ssl, username, password);
+    select_mailbox(&current_message_count, ssl, mailbox);
     char *search_mails_filter = "ALL";
     if (new_only)
         search_mails_filter = "UNSEEN";
-    char *messages_ids = search_mails(&current_message_count, sock, search_mails_filter);
+    char *messages_ids = search_mails(&current_message_count, ssl, search_mails_filter);
 
     int fetch_count = 0, download_count = 0;
     int download_flag = 0;
@@ -518,7 +547,7 @@ int main(int argc, char *argv[]) {
         int message_id = atoi(current_position);
 
         if (message_id > 0) {
-            char *full_fetch_response = fetch_message(&current_message_count, sock, message_id, request_type);
+            char *full_fetch_response = fetch_message(&current_message_count, ssl, message_id, request_type);
             char *header_id = get_id_from_header(full_fetch_response);
             printf("ID %sID\n", header_id);
             fetch_count++;
@@ -560,7 +589,7 @@ int main(int argc, char *argv[]) {
     if (*current_position != '\0') {
         int message_id = atoi(current_position);
         if (message_id > 0) {
-            char *full_fetch_response = fetch_message(&current_message_count, sock, message_id, request_type);
+            char *full_fetch_response = fetch_message(&current_message_count, ssl, message_id, request_type);
             char *header_id = get_id_from_header(full_fetch_response);
             printf("ID %sID\n", header_id);
             fetch_count++;
@@ -605,10 +634,10 @@ int main(int argc, char *argv[]) {
 
     printf("%d messages were downloaded from the '%s' mailbox.\n", download_count, mailbox);
 
-    logout(&current_message_count, sock);
+    logout(&current_message_count, ssl);
 
     fclose(log_file);
     free(messages_ids);
-    close(sock);
+    SSL_shutdown(ssl);
     return EXIT_SUCCESS;
 }
