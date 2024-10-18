@@ -5,8 +5,33 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <regex.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
-char *construct_message(int sock, int *current_message_count, char *text);
+typedef struct {
+    int imaps;
+    int sock;
+    SSL *ssl;
+    SSL_CTX *ctx;
+} Connection;
+
+typedef struct {
+    char *server;
+    char *port;
+    int imaps;
+    char *cert_file;
+    char *cert_addr;
+    int new_only;
+    int headers_only;
+    char *auth_file;
+    char *mailbox;
+    char *out_dir;
+} Args;
+
+char *construct_message(Connection conn, int *current_message_count, char *text);
 
 void error_exit(char *msg, int code) {
     if (msg != NULL)
@@ -27,6 +52,7 @@ char *get_server(int argc, char *argv[]){
             return argv[i];
         }
     }
+    return NULL;
 }
 
 int connect_to_imap(char *server, char *port){
@@ -71,6 +97,57 @@ int connect_to_imap(char *server, char *port){
     return sock;
 }
 
+
+int connect_to_imaps(char *server, char *port, char *cert_file, char *cert_addr, SSL_CTX **ctx_out, SSL **ssl_out) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        error_exit("Failed to create SSL context.", EXIT_FAILURE);
+    }
+    
+    if (!SSL_CTX_set_default_verify_paths(ctx)) {
+        SSL_CTX_free(ctx);
+        error_exit("Failed to set default verify paths.", EXIT_FAILURE);
+    }
+
+    if (!SSL_CTX_load_verify_locations(ctx, (cert_file == NULL ? NULL : cert_file), cert_addr)) {
+        SSL_CTX_free(ctx);
+        error_exit("Failed to load certificate.", EXIT_FAILURE);
+    }
+
+    int sock = connect_to_imap(server, port);
+    if (sock < 0) {
+        SSL_CTX_free(ctx);
+        error_exit("Failed to establish IMAP connection.", EXIT_FAILURE);
+    }
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        error_exit("SSL connection failed.", EXIT_FAILURE);
+    }
+    *ctx_out = ctx;
+    *ssl_out = ssl;
+    return sock;
+}
+
+void cleanup_connection(Connection conn) {
+    if (conn.imaps){
+        SSL_shutdown(conn.ssl);
+        SSL_free(conn.ssl);
+        SSL_CTX_free(conn.ctx);
+        ERR_free_strings();
+        EVP_cleanup();
+    }
+    close(conn.sock);
+}
+
 void parse_auth_file(char *auth_file, char *username, char *password) {
     FILE *file = fopen(auth_file, "r");
     if (!file) {
@@ -89,46 +166,63 @@ void parse_auth_file(char *auth_file, char *username, char *password) {
 }
 
 
-void send_imap_message(int sock, char *message) {
-    if (send(sock, message, strlen(message), 0) == -1) {
-        close(sock);
-        error_exit("Failed to send IMAP message.", EXIT_FAILURE);
+void send_imap_message(Connection conn, char *message) {
+    if (conn.imaps){
+        if (SSL_write(conn.ssl, message, strlen(message)) <= 0) {
+            cleanup_connection(conn);
+            error_exit("Failed to send IMAP message through SSL.", EXIT_FAILURE);
+        }
+    }
+    else{
+        if (send(conn.sock, message, strlen(message), 0) == -1) {
+            cleanup_connection(conn);
+            error_exit("Failed to send IMAP message.", EXIT_FAILURE);
+        }
     }
 }
 
-char *receive_imap_message(int sock){
+char *receive_imap_message(Connection conn){
     size_t buffer_size = 100000;
     char buffer[buffer_size];
     char *response = calloc(10000000, 1);
     if (response == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     int received;
-    
-    while ((received = recv(sock, buffer, buffer_size, 0)) > 0) {
-        buffer[received] = '\0';
-        strcat(response, buffer);
-        if (strstr(response, "\r\n")) {
-            break;
+    if (conn.imaps){
+        while ((received = SSL_read(conn.ssl, buffer, buffer_size)) > 0) {
+            buffer[received] = '\0';
+            strcat(response, buffer);
+            if (strstr(response, "\r\n")) {
+                break;
+            }
+        }
+    }
+    else{
+        while ((received = recv(conn.sock, buffer, buffer_size, 0)) > 0) {
+            buffer[received] = '\0';
+            strcat(response, buffer);
+            if (strstr(response, "\r\n")) {
+                break;
+            }
         }
     }
     if (received < 0) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to receive response.", EXIT_FAILURE);
     }
     else if (received == 0) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Connection closed by peer.", EXIT_FAILURE);
     }
     return response;
 }
 
-int imap_command(int *current_message_count, int sock, char *response_p, char *command_format, ...) {
-
+int imap_command(int *current_message_count, Connection conn, char *response_p, char *command_format, ...) {
     char *text = calloc(4096, 1);
     if (text == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
 
@@ -137,12 +231,11 @@ int imap_command(int *current_message_count, int sock, char *response_p, char *c
     vsnprintf(text, 4096, command_format, args);
     va_end(args);
 
-    char *message = construct_message(sock, current_message_count, text);
+    char *message = construct_message(conn, current_message_count, text);
     free(text);
-    send_imap_message(sock, message);
+    send_imap_message(conn, message);
     free(message);
-    char *response = receive_imap_message(sock);
-    printf("RESPONSE %s\n", response);
+    char *response = receive_imap_message(conn);
     int received_ID;
 
     strcpy(response_p, response);
@@ -174,45 +267,45 @@ int imap_command(int *current_message_count, int sock, char *response_p, char *c
 
 }
 
-void login_to_imap(int *current_message_count, int sock, char *username, char *password) {
+void login_to_imap(int *current_message_count, Connection conn, char *username, char *password) {
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "LOGIN %s %s", username, password) == 1){
+    if (imap_command(current_message_count, conn, response, "LOGIN %s %s", username, password) == 1){
         free(response);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to login.", EXIT_FAILURE);
     }
     free(response);
 }
 
-void select_mailbox(int *current_message_count, int sock, char *mailbox){
+void select_mailbox(int *current_message_count, Connection conn, char *mailbox){
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "SELECT %s", mailbox) == 1){
+    if (imap_command(current_message_count, conn, response, "SELECT %s", mailbox) == 1){
         free(response);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to select the mailbox.", EXIT_FAILURE);
     }
     free(response);
 }
 
-char *search_mails(int *current_message_count, int sock, char *search_mails_filter){
+char *search_mails(int *current_message_count, Connection conn, char *search_mails_filter){
     char *response = calloc(16384, 1);
     char *response_body = calloc(16384, 1);
     if (response == NULL || response_body == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "SEARCH %s", search_mails_filter) == 1){
+    if (imap_command(current_message_count, conn, response, "SEARCH %s", search_mails_filter) == 1){
         free(response);
         free(response_body);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to search mails.", EXIT_FAILURE);
     }
     int last_index = strlen(response) - 2;
@@ -225,48 +318,52 @@ char *search_mails(int *current_message_count, int sock, char *search_mails_filt
     return response_body;
 }
 
-char *construct_message(int sock, int *current_message_count, char *text){
+char *construct_message(Connection conn, int *current_message_count, char *text){
     char *message = calloc(4096, 1);
     if (message == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     snprintf(message, 4096, "A%d %s\r\n", *current_message_count, text);
     return message;
 }
 
-void handshake(int sock) {
-    char *greeting = receive_imap_message(sock);
+void handshake(Connection conn) {
+    char *greeting;
+    if (conn.imaps)
+        greeting = receive_imap_message(conn);
+    else
+        greeting = receive_imap_message(conn);
     if (strstr(greeting, "OK")) {
         free(greeting);
     } else {
         free(greeting);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to get the server greeting.", EXIT_FAILURE);
     }
 }
 
-char *fetch_message(int *current_message_count, int sock, int message_id, char *request_type) {
+char *fetch_message(int *current_message_count, Connection conn, int message_id, char *request_type) {
     size_t fetch_size = 10000000;
     char *full_fetch_response = calloc(fetch_size, 1);
     if (full_fetch_response == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     char *text = calloc(4096, 1);
     if (text == NULL) {
         free(full_fetch_response);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     snprintf(text, 4096, "FETCH %d %s", message_id, request_type);
-    char *message = construct_message(sock, current_message_count, text);
+    char *message = construct_message(conn, current_message_count, text);
     free(text);
-    send_imap_message(sock, message);
+    send_imap_message(conn, message);
     free(message);
     int success = 0;
     while (!success) {
-        char *response = receive_imap_message(sock);
+        char *response = receive_imap_message(conn);
         int received_ID;
         
         size_t current_length = strlen(full_fetch_response);
@@ -278,7 +375,7 @@ char *fetch_message(int *current_message_count, int sock, int message_id, char *
             if (new_full_fetch_response == NULL) {
                 free(full_fetch_response);
                 free(response);
-                close(sock);
+                cleanup_connection(conn);
                 error_exit("Failed to reallocate memory.", EXIT_FAILURE);
             }
             full_fetch_response = new_full_fetch_response;
@@ -337,6 +434,7 @@ int get_message_length(char *fetch_response, int *body_start) {
         regfree(&regex);
         error_exit("Failed to get message length.", EXIT_FAILURE);
     }
+    return 0;
 }
 
 
@@ -367,17 +465,18 @@ char *get_id_from_header(char *fetch_response) {
         regfree(&regex);
         error_exit("Failed to extract message ID.", EXIT_FAILURE);
     }
+    return NULL;
 }
 
-int logout(int *current_message_count, int sock){
+void logout(int *current_message_count, Connection conn){
     char *response = calloc(16384, 1);
     if (response == NULL) {
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
-    if (imap_command(current_message_count, sock, response, "LOGOUT") == 1){
+    if (imap_command(current_message_count, conn, response, "LOGOUT") == 1){
         free(response);
-        close(sock);
+        cleanup_connection(conn);
         error_exit("Failed to logout.", EXIT_FAILURE);
     }
     free(response);
@@ -399,58 +498,61 @@ int header_id_in_log(char *header_id, FILE *log_file, int *line_index) {
     return 0;
 }
 
-int main(int argc, char *argv[]) {
-    int opt;
-    char *server = NULL;
-    char *port = NULL;
-    int imaps = 0;
-    char *cert_file = NULL;
-    char *cert_addr = "/etc/ssl/certs";
-    int new_only = 0;
-    int headers_only = 0;
-    char *auth_file = NULL;
-    char *mailbox = "INBOX";
-    char *out_dir = NULL;
+Args parse_args(int argc, char *argv[]){
+    Args args;
 
-    if (!(server = get_server(argc, argv))) {
+    args.server = NULL;
+    args.port = NULL;
+    args.imaps = 0;
+    args.cert_file = NULL;
+    args.cert_addr = "/etc/ssl/certs";
+    args.new_only = 0;
+    args.headers_only = 0;
+    args.auth_file = NULL;
+    args.mailbox = "INBOX";
+    args.out_dir = NULL;
+    
+    int opt;
+
+    if (!(args.server = get_server(argc, argv))) {
         error_exit("Missing server or IP address argument.", EXIT_FAILURE);
     }
 
     while ((opt = getopt(argc, argv, "p:Tc:C:nhb:a:o:")) != -1) {
         switch (opt) {
             case 'p':
-                port = optarg;
+                args.port = optarg;
                 break;
             case 'T':
-                imaps = 1;
+                args.imaps = 1;
                 break;
             case 'c':
-                cert_file = optarg;
+                args.cert_file = optarg;
                 break;
             case 'C':
-                cert_addr = optarg;
+                args.cert_addr = optarg;
                 break;
             case 'n':
-                new_only = 1;
+                args.new_only = 1;
                 break;
             case 'h':
-                headers_only = 1;
+                args.headers_only = 1;
                 break;
             case 'a':
-                auth_file = optarg;
+                args.auth_file = optarg;
                 break;
             case 'b':
-                mailbox = optarg;
+                args.mailbox = optarg;
                 break;
             case 'o':
-                out_dir = optarg;
+                args.out_dir = optarg;
                 break;
             default:
                 error_exit("Usage: imapcl server [-p port] [-T [-c certfile] [-C certaddr]] [-n] [-h] -a auth_file [-b MAILBOX] -o out_dir.", EXIT_FAILURE);
         }
     }
 
-    if (!auth_file || !out_dir) {
+    if (!args.auth_file || !args.out_dir) {
         error_exit("Missing required argument -a auth_file or -o out_dir.", EXIT_FAILURE);
     }
     
@@ -458,50 +560,67 @@ int main(int argc, char *argv[]) {
         error_exit("Usage: imapcl server [-p port] [-T [-c certfile] [-C certaddr]] [-n] [-h] -a auth_file [-b MAILBOX] -o out_dir.", EXIT_FAILURE);
     }
 
-    if (!port){
-        port = imaps ? "993" : "143";
+    if (!args.port){
+        args.port = args.imaps ? "993" : "143";
     }
+    return args;
 
-//TODO remove everything from the main func :) and 1 file
-//TODO make MAKE with a correct filename
-//TODO REFACTOR 1 func = 1 action!!!!!!!!
-//TODO args to struct
-//TODO valgrind
+}
 
-//TODO imaps
-//TODO normal buf size
-//TODO documentation
-//TODO comments
+
+int main(int argc, char *argv[]) {
+    Args args = parse_args(argc, argv); 
+    //TODO remove everything from the main func :) and 1 file
+    //TODO make MAKE with a correct filename
+    //TODO documentation
+    //TODO comments
+    //TODO memory from 562
+    //TODO func declaration
 
     char username[256];
     char password[256];
 
-    parse_auth_file(auth_file, username, password);
+    parse_auth_file(args.auth_file, username, password);
     int current_message_count = 0;
-    int sock = 0;
-    if (!imaps){
-        sock = connect_to_imap(server, port);
+
+    Connection conn;
+    conn.sock = 0;
+    conn.ssl = NULL;
+    conn.ctx = NULL;
+    conn.imaps = args.imaps;
+
+    if (conn.imaps) {
+        conn.sock = connect_to_imaps(args.server, args.port, args.cert_file, args.cert_addr, &conn.ctx, &conn.ssl);
+        if (!conn.sock) {
+            error_exit("Failed to establish IMAPS connection.", EXIT_FAILURE);
+        }
+    } else {
+        conn.sock = connect_to_imap(args.server, args.port);
+        if (conn.sock < 0) {
+            error_exit("Failed to establish IMAP connection.", EXIT_FAILURE);
+        }
     }
-    handshake(sock);
-    login_to_imap(&current_message_count, sock, username, password);
-    select_mailbox(&current_message_count, sock, mailbox);
+
+    handshake(conn);
+    login_to_imap(&current_message_count, conn, username, password);
+    select_mailbox(&current_message_count, conn, args.mailbox);
     char *search_mails_filter = "ALL";
-    if (new_only)
+    if (args.new_only)
         search_mails_filter = "UNSEEN";
-    char *messages_ids = search_mails(&current_message_count, sock, search_mails_filter);
+    char *messages_ids = search_mails(&current_message_count, conn, search_mails_filter);
 
     int fetch_count = 0, download_count = 0;
     int download_flag = 0;
     char request_type[1024];
     char log_file_path[1024];
 
-    if (headers_only){
+    if (args.headers_only){
         strcpy(request_type, "BODY.PEEK[HEADER]");
-        snprintf(log_file_path, sizeof(log_file_path), "%s/log_h.txt", out_dir);
+        snprintf(log_file_path, sizeof(log_file_path), "%s/log_h.txt", args.out_dir);
     }
     else{
         strcpy(request_type, "BODY.PEEK[]");
-        snprintf(log_file_path, sizeof(log_file_path), "%s/log.txt", out_dir);
+        snprintf(log_file_path, sizeof(log_file_path), "%s/log.txt", args.out_dir);
     }
 
     char *current_position = messages_ids;
@@ -518,28 +637,23 @@ int main(int argc, char *argv[]) {
         int message_id = atoi(current_position);
 
         if (message_id > 0) {
-            char *full_fetch_response = fetch_message(&current_message_count, sock, message_id, request_type);
+            char *full_fetch_response = fetch_message(&current_message_count, conn, message_id, request_type);
             char *header_id = get_id_from_header(full_fetch_response);
-            printf("ID %sID\n", header_id);
             fetch_count++;
             int body_start, line_index;
             int length = get_message_length(full_fetch_response, &body_start);
-            printf("LENGTH %dLENGTH\n", length);
             char *message = strndup(full_fetch_response + body_start, length);
-            printf("MES START %s MES END \n", message);
 
             if (!header_id_in_log(header_id, log_file, &line_index)){
                 fprintf(log_file, "%s\n", header_id);
                 download_flag = 1;
             }
-            printf("LINE %d LINE END \n", line_index);
-
             if (download_flag){
                 char mail_file_path[1024];
-                if (headers_only)
-                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d_h.txt", out_dir, line_index);
+                if (args.headers_only)
+                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d_h.txt", args.out_dir, line_index);
                 else
-                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d.txt", out_dir, line_index);
+                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d.txt", args.out_dir, line_index);
                 FILE *mail_file = fopen(mail_file_path, "w");
 
                 if (mail_file == NULL) {
@@ -560,28 +674,23 @@ int main(int argc, char *argv[]) {
     if (*current_position != '\0') {
         int message_id = atoi(current_position);
         if (message_id > 0) {
-            char *full_fetch_response = fetch_message(&current_message_count, sock, message_id, request_type);
+            char *full_fetch_response = fetch_message(&current_message_count, conn, message_id, request_type);
             char *header_id = get_id_from_header(full_fetch_response);
-            printf("ID %sID\n", header_id);
             fetch_count++;
             int body_start, line_index;
             int length = get_message_length(full_fetch_response, &body_start);
-            printf("LENGTH %dLENGTH\n", length);
             char *message = strndup(full_fetch_response + body_start, length);
-            printf("MES START %s MES END \n", message);
-
             if (!header_id_in_log(header_id, log_file, &line_index)){
                 fprintf(log_file, "%s\n", header_id);
                 download_flag = 1;
             }
-            printf("LINE %d LINE END \n", line_index);
 
             if (download_flag){
                 char mail_file_path[1024];
-                if (headers_only)
-                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d_h.txt", out_dir, line_index);
+                if (args.headers_only)
+                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d_h.txt", args.out_dir, line_index);
                 else
-                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d.txt", out_dir, line_index);
+                    snprintf(mail_file_path, sizeof(mail_file_path), "%s/%d.txt", args.out_dir, line_index);
                 FILE *mail_file = fopen(mail_file_path, "w");
 
                 if (mail_file == NULL) {
@@ -603,12 +712,12 @@ int main(int argc, char *argv[]) {
         return EXIT_SUCCESS;
     }
 
-    printf("%d messages were downloaded from the '%s' mailbox.\n", download_count, mailbox);
+    printf("%d messages were downloaded from the '%s' mailbox.\n", download_count, args.mailbox);
 
-    logout(&current_message_count, sock);
+    logout(&current_message_count, conn);
 
     fclose(log_file);
     free(messages_ids);
-    close(sock);
+    cleanup_connection(conn);
     return EXIT_SUCCESS;
 }
