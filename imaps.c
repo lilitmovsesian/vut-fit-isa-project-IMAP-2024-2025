@@ -75,16 +75,27 @@ int connect_to_imap(char *server, char *port){
 }
 
 
-SSL *connect_to_imaps(char *server, char *port) {
+SSL *connect_to_imaps(char *server, char *port, char *cert_file, char *cert_addr) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
 
-    const SSL_METHOD *method = SSLv23_client_method();
+    const SSL_METHOD *method = TLS_client_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
     if (!ctx) {
         error_exit("Failed to create SSL context.", EXIT_FAILURE);
     }
+    
+    if (!SSL_CTX_set_default_verify_paths(ctx)) {
+        SSL_CTX_free(ctx);
+        error_exit("Failed to set default verify paths", EXIT_FAILURE);
+    }
+
+    if (!SSL_CTX_load_verify_locations(ctx, (cert_file == NULL ? NULL : cert_file), cert_addr)) {
+        SSL_CTX_free(ctx);
+         error_exit("Failed to load certificate", EXIT_FAILURE);
+    }
+
     int sock = connect_to_imap(server, port);
     
     SSL *ssl = SSL_new(ctx);
@@ -510,7 +521,7 @@ int main(int argc, char *argv[]) {
     parse_auth_file(auth_file, username, password);
     int current_message_count = 0;
     
-    SSL *ssl = connect_to_imaps(server, port);
+    SSL *ssl = connect_to_imaps(server, port, cert_file, cert_addr);
     handshake(ssl);
     login_to_imap(&current_message_count, ssl, username, password);
     select_mailbox(&current_message_count, ssl, mailbox);
