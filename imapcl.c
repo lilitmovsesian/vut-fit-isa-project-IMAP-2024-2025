@@ -667,15 +667,6 @@ Args parse_args(int argc, char *argv[]){
 int main(int argc, char *argv[]) {
     /*Parses arguments and stores them in the 'args' structure.*/
     Args args = parse_args(argc, argv); 
-<<<<<<< HEAD
-=======
-    //TODO remove everything from the main func :) and 1 file
-    //TODO make MAKE with a correct filename
-    //TODO documentation
-    //TODO comments
-    //TODO memory from 583
-    //TODO func declaration
->>>>>>> cff3a6e1184e80abfee02220b7da90e9bd00e9c7
 
     char username[256];
     char password[256];
