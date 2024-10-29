@@ -1,9 +1,28 @@
 # ISA_IMAP_Client_with_TLS_Support
 
-## Author: Lilit Movsesian 
+## Author: Movsesian Lilit xmovse00
  
 ## Overview
 The `imapcl` program allows reading electronic mail using the IMAP4rev1 protocol (RFC 3501). The program downloads messages stored on the server and saves them in the RFC 5322 format in a specified directory (each message separately) and outputs the number of downloaded messages to standard output. Additional parameters can modify its functionality.
+
+## Required Libraries 
+The program relies on the following libraries:
+
+### OpenSSL
+
+- **Version**: 1.1.1 or higher
+
+- **Components**:
+  - **libssl**: 
+    Provides support for SSL and TLS protocols.
+  - **libcrypto**: 
+    Provides cryptographic functions for secure data handling.
+
+- **Linking**:
+    Both libraries are linked in the Makefile with the following flags: 
+    ```
+    -lssl -lcrypto
+    ```
 
 ## Compilation
 The program comprises a `Makefile` and the source file `imapcl.c`. To compile the program, run:
