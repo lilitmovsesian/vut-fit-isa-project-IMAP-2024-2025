@@ -213,6 +213,7 @@ void send_imap_message(Connection conn, char *message) {
         /* Sends the message securely using SSL_write. */
         if (SSL_write(conn.ssl, message, strlen(message)) <= 0) {
             cleanup_connection(conn);
+            free(message);
             error_exit("Failed to send IMAP message through SSL.", EXIT_FAILURE);
         }
     }
@@ -220,6 +221,7 @@ void send_imap_message(Connection conn, char *message) {
         /* Sends the message over an unencrypted socket connection. */
         if (send(conn.sock, message, strlen(message), 0) == -1) {
             cleanup_connection(conn);
+            free(message);
             error_exit("Failed to send IMAP message.", EXIT_FAILURE);
         }
     }
@@ -263,11 +265,13 @@ char *receive_imap_message(Connection conn){
     /* Checks if an error is encountered. */
     if (received < 0) {
         cleanup_connection(conn);
+        free(response);
         error_exit("Failed to receive response.", EXIT_FAILURE);
     }
     /* Checks if the connection was closed by the server. */
     else if (received == 0) {
         cleanup_connection(conn);
+        free(response);
         error_exit("Connection closed by peer.", EXIT_FAILURE);
     }
     return response;
@@ -279,6 +283,7 @@ int imap_command(int *current_message_count, Connection conn, char *response_p, 
     char *text = calloc(4096, 1);
     if (text == NULL) {
         cleanup_connection(conn);
+        free(response_p);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
 
@@ -364,9 +369,14 @@ void select_mailbox(int *current_message_count, Connection conn, char *mailbox){
 /*A function that sends a SEARCH command with or without a filtering for new mails. */
 char *search_mails(int *current_message_count, Connection conn, char *search_mails_filter){
     char *response = calloc(16384, 1);
-    char *response_body = calloc(16384, 1);
-    if (response == NULL || response_body == NULL) {
+    if (response == NULL) {
         cleanup_connection(conn);
+        error_exit("Failed to allocate memory.", EXIT_FAILURE);
+    }
+    char *response_body = calloc(16384, 1);
+    if (response_body == NULL) {
+        cleanup_connection(conn);
+        free(response);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     if (imap_command(current_message_count, conn, response, "SEARCH %s", search_mails_filter) == 1){
@@ -392,6 +402,7 @@ char *construct_message(Connection conn, int *current_message_count, char *text)
     char *message = calloc(4096, 1);
     if (message == NULL) {
         cleanup_connection(conn);
+        free(text);
         error_exit("Failed to allocate memory.", EXIT_FAILURE);
     }
     snprintf(message, 4096, "A%d %s\r\n", *current_message_count, text);
@@ -467,21 +478,23 @@ char *fetch_message(int *current_message_count, Connection conn, int message_id,
             /* Checks for a successful "OK" response with a matching message count ID. */
             if (sscanf(line, "A%d OK FETCH completed", &received_ID) > 0) {
                 if (received_ID == *current_message_count) {
-                    free(response);
                     success = 1;
+                    break;
                 }
             }
             /* Checks for a "BAD" or "NO" response with a matching message count ID.*/
             else if(sscanf(line, "A%d NO", &received_ID) > 0 || sscanf(line, "A%d BAD", &received_ID) > 0){
+                free(response);
+                free(full_fetch_response);
                 error_exit("Failed to fetch mails.", EXIT_FAILURE);
             }
 
             line = strtok(NULL, "\n");
         }
+        free(response);
     }
 
     (*current_message_count)++;
-
     return full_fetch_response;
 }
 
@@ -727,6 +740,8 @@ int main(int argc, char *argv[]) {
     /* Opens the log file to keep track of downloaded message IDs.*/
     FILE *log_file = fopen(log_file_path, "a+");
     if (log_file == NULL) {
+        free(messages_ids);
+        cleanup_connection(conn);
         error_exit("Failed to open a file.", EXIT_FAILURE);
     }
 
@@ -761,6 +776,12 @@ int main(int argc, char *argv[]) {
                 FILE *mail_file = fopen(mail_file_path, "w");
 
                 if (mail_file == NULL) {
+                    free(header_id);
+                    free(message);
+                    free(full_fetch_response);        
+                    fclose(log_file);
+                    free(messages_ids);
+                    cleanup_connection(conn);
                     error_exit("Failed to open a file.", EXIT_FAILURE);
                 }
                 fprintf(mail_file, "%s", message);
@@ -799,6 +820,12 @@ int main(int argc, char *argv[]) {
                 FILE *mail_file = fopen(mail_file_path, "w");
 
                 if (mail_file == NULL) {
+                    free(header_id);
+                    free(message);
+                    free(full_fetch_response);        
+                    fclose(log_file);
+                    free(messages_ids);
+                    cleanup_connection(conn);
                     error_exit("Failed to open a file.", EXIT_FAILURE);
                 }
                 fprintf(mail_file, "%s", message);
