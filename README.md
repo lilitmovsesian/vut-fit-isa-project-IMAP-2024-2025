@@ -1,6 +1,7 @@
 # ISA_IMAP_Client_with_TLS_Support
 
 ## Author: Movsesian Lilit xmovse00
+## Date: 16.11.2024
  
 ## Overview
 The `imapcl` program allows reading electronic mail using the IMAP4rev1 protocol (RFC 3501). The program downloads messages stored on the server and saves them in the RFC 5322 format in a specified directory (each message separately) and outputs the number of downloaded messages to standard output. Additional parameters can modify its functionality.

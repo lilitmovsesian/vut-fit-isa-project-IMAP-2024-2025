@@ -1,3 +1,8 @@
+/*
+Author:
+Surname and Name: Movsesian Lilit
+Login: xmovse00
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
